@@ -232,8 +232,19 @@ for joint, position in starting_position.items():
 # ------------------------------------------------------------------------------
 
 def camera_to_world_coordinates(camera_position, camera_offset=0.0):
-    """Convert camera-relative coordinates to global coordinates using exact URDF measurements and correction for
-    torso lift"""
+    """
+    Converts camera-relative coordinates to global world coordinates using sensor fusion.
+    
+    Combines GPS, compass, torso height, and camera parameters to calculate precise
+    world coordinates of detected objects.
+    
+    Args:
+        camera_position (list): [x, y, z] in camera frame
+        camera_offset (float): Z-axis correction offset
+        
+    Returns:
+        list: World coordinates [x, y, z] in meters
+    """
     # Get robot's current position and orientation
     robot_pos = gps.getValues()
     compass_val = compass.getValues()
@@ -325,7 +336,20 @@ def calculate_approach_offsets(robot_pos, target_pos):
 
 
 def calculate_inverse_kinematics(target_position, offset_x=0.0, offset_y=0.0):
-    """Calculate inverse kinematics with proper bounds checking, no precision mode."""
+    """
+    Computes joint angles required to position end effector at target location.
+    
+    Uses IKPY chain with joint limit constraints and initial position clamping
+    for reliable solutions.
+    
+    Args:
+        target_position (list): Desired [x, y, z] in world coordinates
+        offset_x (float): X-axis safety offset
+        offset_y (float): Y-axis safety offset
+        
+    Returns:
+        dict: Joint name to angle mapping or None if no solution
+    """
 
     # Apply offsets directly to the target position
     final_target = [
@@ -378,13 +402,20 @@ def angle_difference(angle1, angle2):
 
 def get_target_position(behavior_name):
     """
-    Get target position from the blackboard.
-
+    Retrieves target position data from the shared blackboard.
+    
+    Centralizes position data access across behaviors with consistent
+    error handling and logging. Serves as the single source of truth
+    for target coordinates throughout the behavior tree.
+    
     Args:
-        behavior_name: Name of the calling behavior (for logging)
-
+        behavior_name (str): Name of the calling behavior (for logging)
+    
     Returns:
         List[float]: Target position [x, y, z] or None if not available
+    
+    Raises:
+        No exceptions - errors are caught and logged internally
     """
     try:
         blackboard = py_trees.blackboard.Blackboard()
@@ -403,6 +434,20 @@ def get_target_position(behavior_name):
 # ------------------------------------------------------------------------------
 
 class EnhancedObjectRecognizer(py_trees.behaviour.Behaviour):
+    """
+    Computer vision-based object detection and localization behavior.
+    
+    Features:
+    - Multi-sample averaging for position stability
+    - Timeout handling
+    - Blackboard integration for cross-behavior communication
+    - Automatic coordinate conversion to world frame
+    
+    Args:
+        z_offset (float): Vertical offset for grasp positioning
+        samples (int): Number of detection samples to average
+        timeout (float): Max allowed recognition time
+    """
     def __init__(self, name, z_offset=0.0, samples=5, timeout=3.0):
         super(EnhancedObjectRecognizer, self).__init__(name)
         self.z_offset = z_offset
@@ -491,6 +536,20 @@ class EnhancedObjectRecognizer(py_trees.behaviour.Behaviour):
 
 
 class ComprehensiveScanner(py_trees.behaviour.Behaviour):
+    """
+    Systematic environment scanning behavior for object discovery.
+    
+    Implements:
+    - 360-degree rotational scanning
+    - Head/camera positioning optimization
+    - Progressive scanning with stabilization periods
+    - Integrated object recognition at each position
+    
+    Args:
+        total_angles (int): Number of scanning positions
+        angle_increment (float): Degrees between positions
+        rotation_speed (float): Rad/s for base rotation
+    """
     def __init__(self, name, total_angles=8, angle_increment=45, rotation_speed=1.0):
         super(ComprehensiveScanner, self).__init__(name)
         self.total_angles = total_angles
@@ -569,6 +628,16 @@ class ComprehensiveScanner(py_trees.behaviour.Behaviour):
 
 
 class GraspController(py_trees.behaviour.Behaviour):
+    """
+    Robotic grasping controller with force feedback verification.
+    
+    State Machine:
+    1. APPROACHING: Slowly close gripper until contact
+    2. VERIFYING: Maintain grip with force validation
+    
+    Args:
+        force_threshold (float): Minimum grip force (N) for success
+    """
     def __init__(self, name, force_threshold=-12.0):
         super(GraspController, self).__init__(name)
         self.force_threshold = force_threshold
@@ -661,7 +730,23 @@ class GraspController(py_trees.behaviour.Behaviour):
 
 # --- Navigation Behaviors ---
 class MoveToObject(py_trees.behaviour.Behaviour):
-    """Navigate to a target using GPS and compass for direct navigation"""
+    """
+    Navigation behavior that moves robot to target object coordinates.
+    
+    Implements:
+    - GPS and compass-based path planning
+    - Dynamic speed control based on distance
+    - Obstacle avoidance (using distance sensors)
+    - Arm pre-positioning when approaching target
+    
+    Uses a state machine to handle:
+    - INITIAL: Setup and target validation
+    - ORIENTING: Rotational alignment to target
+    - APPROACHING: Main movement phase
+    - STABILIZING: Motion dampening before arm operations
+    - ADJUSTING_ARM: Coordinated arm movement during approach
+    - FINAL_APPROACH: Precision positioning at target location
+    """
 
     def __init__(self, name, recognize_object, gps, compass, move_arm_behavior, camera):
         super(MoveToObject, self).__init__(name)
@@ -860,7 +945,19 @@ class MoveToObject(py_trees.behaviour.Behaviour):
 
 
 class MoveToWaypoint(py_trees.behaviour.Behaviour):
-
+    """
+    Autonomous navigation controller using PID-based motion control.
+    
+    Features:
+    - Waypoint sequencing with distance thresholds
+    - Anti-wobble steering logic
+    - Stuck detection and recovery
+    - Smooth velocity ramping
+    
+    Args:
+        waypoints (list): Sequence of (x,y,z) targets
+        timeout (float): Max duration per waypoint
+    """
     def __init__(self, name, waypoints, timeout=30.0):
         super(MoveToWaypoint, self).__init__(name)
         self.waypoints = waypoints
@@ -1066,7 +1163,21 @@ class MoveToWaypoint(py_trees.behaviour.Behaviour):
 
 # --- Manipulation Behaviors ---
 class MoveArmIK(py_trees.behaviour.Behaviour):
-
+    """
+    Inverse Kinematics-based arm motion planner.
+    
+    Implements:
+    - Pre-grasp posture positioning
+    - Safety offset application
+    - Joint limit enforcement
+    - Progressive motion validation
+    
+    Args:
+        offset_x (float): X-axis safety margin
+        offset_y (float): Y-axis safety margin
+        tolerance (float): Joint angle tolerance (rad)
+        timeout (float): Max allowed motion time
+    """
     def __init__(self, name, offset_x=0.0, offset_y=0.0, tolerance=0.015, timeout=5.0):
         super(MoveArmIK, self).__init__(name)
         self.offset_x = offset_x
@@ -1172,7 +1283,20 @@ class MoveArmIK(py_trees.behaviour.Behaviour):
 
 
 class MoveToPosition(py_trees.behaviour.Behaviour):
-    """Move joints to a predefined position"""
+    """
+    Precise joint-space controller for arm positioning.
+    
+    Features:
+    - Multiple joint coordination with velocity control
+    - Position feedback with tolerance checking
+    - Progress monitoring to detect stalls/obstructions
+    - Auto-completion on timeout with success estimation
+    
+    Args:
+        joint_targets (dict): Mapping of joint names to target positions (rad)
+        tolerance (float): Acceptable position error margin (rad)
+        timeout (float): Maximum allowed execution time (s)
+    """
 
     def __init__(self, name, joint_targets, tolerance=0.02, timeout=10.0):
         super(MoveToPosition, self).__init__(name)
@@ -1268,7 +1392,19 @@ class MoveToPosition(py_trees.behaviour.Behaviour):
 
 
 class OpenGripper(py_trees.behaviour.Behaviour):
-    """Open the gripper to release an object with verification"""
+    """
+    Controlled gripper opening with position verification.
+    
+    Carefully opens gripper fingers to release grasped objects while
+    monitoring finger positions to ensure complete release.
+    
+    Implements a timeout mechanism to handle cases where mechanical
+    obstructions might prevent full opening.
+    
+    Args:
+        open_position (float): Target finger opening width (m)
+        timeout (float): Maximum allowed opening time (s)
+    """
 
     def __init__(self, name, open_position=0.045, timeout=2.0):
         super(OpenGripper, self).__init__(name)
@@ -1314,8 +1450,19 @@ class OpenGripper(py_trees.behaviour.Behaviour):
 
 
 class LiftAndVerify(py_trees.behaviour.Behaviour):
-    """Lift the grasped object and verify it's still held securely"""
-
+    """
+    Object transportation controller with grip integrity monitoring.
+    
+    Combines:
+    - Coordinated joint motion for vertical lifting
+    - Continuous force feedback validation
+    - Timeout-protected motion execution
+    
+    Args:
+        lift_positions (dict): Target joint angles for lift
+        timeout (float): Max lift duration
+        force_threshold (float): Minimum required grip force
+    """
     def __init__(self, name, lift_positions, timeout=2.0, force_threshold=-5.0):
         super(LiftAndVerify, self).__init__(name)
         self.lift_positions = lift_positions  # Dictionary of joint positions for lifting
@@ -1379,6 +1526,22 @@ class LiftAndVerify(py_trees.behaviour.Behaviour):
 
 # Backup after grasp
 class BackupAfterGrasp(py_trees.behaviour.Behaviour):
+    """
+    Safe backward movement after successful object grasping.
+    
+    Creates clearance between robot and environment after grasping
+    to prevent collisions during subsequent lifting operations.
+    
+    Features:
+    - Controlled linear backward motion
+    - Distance-based termination
+    - Timeout safety
+    - State-based execution (INIT → BACKUP)
+    
+    Args:
+        backup_distance (float): Desired retreat distance (m)
+        duration (float): Maximum allowed backup time (s)
+    """
     def __init__(self, name, backup_distance=0.12, duration=3.0):
         super(BackupAfterGrasp, self).__init__(name)
         self.backup_distance = backup_distance
@@ -1430,7 +1593,18 @@ class BackupAfterGrasp(py_trees.behaviour.Behaviour):
 
 # --- Decorators and Composites ---
 class CheckHardwareStatus(py_trees.behaviour.Behaviour):
-    """Check if all hardware components are functioning properly"""
+    """
+    Robot hardware integrity verification behavior.
+    
+    Systematically checks all required hardware components:
+    - Motor controllers
+    - Position sensors
+    - Camera subsystem
+    - Navigation sensors (GPS, compass)
+    
+    Fails early if any critical component is non-functional,
+    preventing unsafe robot operation with faulty hardware.
+    """
 
     def __init__(self, name):
         super(CheckHardwareStatus, self).__init__(name)
@@ -1579,8 +1753,19 @@ def create_behavior_tree():
 
 
 class RuntimeMonitor:
-    """Monitors and logs robot performance using GPS and sensors"""
-
+    """
+    System health and performance monitoring subsystem.
+    
+    Tracks:
+    - Joint position histories
+    - Navigation trajectories
+    - Sensor consistency
+    - Battery status (if available)
+    - Computational efficiency
+    
+    Args:
+        log_interval (float): Seconds between status reports
+    """
     def __init__(self, log_interval=10.0):
         self.start_time = robot.getTime()
         self.last_log_time = self.start_time
