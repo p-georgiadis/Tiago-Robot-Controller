@@ -2,8 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 TIAGo Robot Controller - Pick and Place Operations
+
+Copyright (c) 2025 Panagiotis Georgiadis. All Rights Reserved.
+
 This controller implements a behavior tree architecture for a TIAGo robot
 to perform pick and place operations in the Webots simulator.
+
+Author: Panagiotis Georgiadis
+Email: pgeorgiadis.it@gmail.com
 """
 
 # ------------------------------------------------------------------------------
@@ -20,9 +26,7 @@ import urdf_parser_py.urdf as urdf_model
 # Constants
 MAX_MOTOR_SPEED = 6.0
 MIN_MOTOR_SPEED = 0.5
-DEFAULT_PRINT_INTERVAL = 50
-ANGLE_TOLERANCE = 0.05  # About 3 degrees
-WAYPOINT_DISTANCE_THRESHOLD = 0.5  # Meters
+ANGLE_TOLERANCE = 0.05  # ~3.5 degrees
 
 # ------------------------------------------------------------------------------
 # ROBOT INITIALIZATION AND SETUP
@@ -157,11 +161,6 @@ def initialize_camera(camera, reduce_resolution=False):
         camera.enable(timestep)
         camera.recognitionEnable(timestep)
 
-        # Use grayscale to reduce memory usage if needed
-        if reduce_resolution:
-            # Enable with lower refresh rate to reduce CPU usage
-            camera.setFov(0.8)  # Reduce field of view
-
         print(f"Camera configured: {camera.getWidth()}x{camera.getHeight()}")
 
 
@@ -177,6 +176,10 @@ gps.enable(timestep)
 
 compass = robot.getDevice('compass')
 compass.enable(timestep)
+
+# Initialize Lidar
+lidar = robot.getDevice("Hokuyo URG-04LX-UG01")
+lidar.enable(timestep)
 
 # Enable force feedback for grippers
 motors['gripper_left_finger_joint'].enableForceFeedback(timestep)
@@ -212,13 +215,19 @@ lift_position = {
 
 # Stable place position - controlled extension
 place_position = {
-    "torso_lift_joint": 0.3, "arm_1_joint": 0.7, "arm_2_joint": 0.0,
-    "arm_3_joint": -1.2, "arm_4_joint": 1.2, "arm_5_joint": -1.5,
-    "arm_6_joint": 0.0, "arm_7_joint": -1.5
+    "torso_lift_joint": 0.2,
+    "arm_1_joint": 1.6,
+    "arm_2_joint": 1.02,
+    "arm_3_joint": 0,
+    "arm_4_joint": 1.2,
+    "arm_5_joint": 0.5,
+    "arm_6_joint": 0,
+    "arm_7_joint": -2.07,
 }
 
 table_waypoints = [
-    (0.2, -0.7, 0.095)  # Then move to table position
+    (1.0, -.9, 0.095),
+    (0.2, -1.5, 0.095)  # Then move to table position
 ]
 home_waypoint = [(0.3, 0.0, 0.095)]  # Simple home position
 
@@ -429,9 +438,145 @@ def get_target_position(behavior_name):
     print(f"{behavior_name}: No target position available!")
     return None
 
+
+def create_movement_with_avoidance(movement_behavior):
+    """Wraps a movement behavior with obstacle avoidance"""
+
+    # For testing, simply return the original behavior with no wrapping
+    # This will disable obstacle avoidance but keep the behavior tree structure intact
+    return movement_behavior
+
+    # The code below would be uncommented when we get lidar working correctly
+    '''
+    # Create a selector (fallback) node
+    movement_selector = py_trees.composites.Selector(
+        name=f"Safe_{movement_behavior.name}",
+        memory=False  # Re-evaluate children on each tick
+    )
+
+    # Add obstacle avoidance with higher priority
+    obstacle_avoidance = LidarObstacleAvoidance(
+        f"ObstacleAvoidance_{movement_behavior.name}",
+        safety_distance=0.5
+    )
+
+    # Add behaviors to selector (first one that succeeds is used)
+    movement_selector.add_children([obstacle_avoidance, movement_behavior])
+
+    return movement_selector
+    '''
+
+
 # ------------------------------------------------------------------------------
 # BEHAVIOR TREE NODE CLASSES
 # ------------------------------------------------------------------------------
+class LidarObstacleAvoidance(py_trees.behaviour.Behaviour):
+    """Uses Lidar to detect and avoid obstacles reactively"""
+
+    def __init__(self, name, safety_distance=0.5, max_speed=3.0):
+        super(LidarObstacleAvoidance, self).__init__(name)
+        self.safety_distance = safety_distance
+        self.max_speed = max_speed
+        self.obstacle_detected = False
+
+    def initialise(self):
+        self.obstacle_detected = False
+
+    def update(self):
+        # Get the Lidar range image
+        range_image = lidar.getRangeImage()
+
+        # Calculate sectors for the Lidar readings
+        resolution = lidar.getHorizontalResolution()  # Should be 667 based on your screenshot
+
+        # Define the safe field of view (ignore sides where robot body is)
+        # For a 240-degree FOV, we'll use the central 180 degrees
+        # and ignore the 30 degrees on each side that might see the robot
+
+        # Define sectors for a 240-degree FOV centered at front
+        side_ignore_angle = 30  # degrees to ignore on each side
+        fov_degrees = 240
+
+        # Calculate how many points to ignore on each side
+        points_per_degree = resolution / fov_degrees
+        ignore_points = int(side_ignore_angle * points_per_degree)
+
+        # Define the valid range of indices (ignoring the sides)
+        valid_start = ignore_points
+        valid_end = resolution - ignore_points
+
+        # Now define sectors within the valid range
+        sector_width = (valid_end - valid_start) // 5  # 5 sectors across valid FOV
+
+        far_left_start = valid_start
+        far_left_end = valid_start + sector_width
+
+        left_start = far_left_end
+        left_end = left_start + sector_width
+
+        center_start = left_end
+        center_end = center_start + sector_width
+
+        right_start = center_end
+        right_end = right_start + sector_width
+
+        far_right_start = right_end
+        far_right_end = valid_end
+
+        # Find minimum distances in each sector (with minimum valid range check)
+        min_valid_range = 0.25  # Ignore very close readings (likely self-detections)
+
+        center_readings = [r for i, r in enumerate(range_image)
+                           if center_start <= i < center_end and r >= min_valid_range and r < 5.0]
+        left_readings = [r for i, r in enumerate(range_image)
+                         if left_start <= i < left_end and r >= min_valid_range and r < 5.0]
+        right_readings = [r for i, r in enumerate(range_image)
+                          if right_start <= i < right_end and r >= min_valid_range and r < 5.0]
+
+        # Calculate minimum distances, using infinity if no valid readings
+        center_distance = min(center_readings) if center_readings else float('inf')
+        left_distance = min(left_readings) if left_readings else float('inf')
+        right_distance = min(right_readings) if right_readings else float('inf')
+
+        # Print debugging info occasionally
+        if robot.getTime() % 5 < 0.1:  # Every ~5 seconds
+            print(
+                f"DEBUG - Center dist: {center_distance:.2f}m, Left: {left_distance:.2f}m, Right: {right_distance:.2f}m")
+            print(
+                f"DEBUG - Valid ranges: {len(center_readings)} center, {len(left_readings)} left, {len(right_readings)} right")
+
+        # Detect obstacles using the filtered readings
+        if (center_distance < self.safety_distance or
+                left_distance < self.safety_distance * 0.8 or
+                right_distance < self.safety_distance * 0.8):
+
+            self.obstacle_detected = True
+
+            # Determine avoidance direction
+            if center_distance < self.safety_distance:
+                # Choose direction based on which side has more space
+                if right_distance > left_distance:
+                    print(f"Obstacle ahead! Turning right. Center: {center_distance:.2f}m")
+                    leftMotor.setVelocity(self.max_speed * 0.7)
+                    rightMotor.setVelocity(-self.max_speed * 0.4)
+                else:
+                    print(f"Obstacle ahead! Turning left. Center: {center_distance:.2f}m")
+                    leftMotor.setVelocity(-self.max_speed * 0.4)
+                    rightMotor.setVelocity(self.max_speed * 0.7)
+            elif left_distance < self.safety_distance * 0.8:
+                print(f"Obstacle on left! Turning right. Left: {left_distance:.2f}m")
+                leftMotor.setVelocity(self.max_speed * 0.7)
+                rightMotor.setVelocity(-self.max_speed * 0.2)
+            elif right_distance < self.safety_distance * 0.8:
+                print(f"Obstacle on right! Turning left. Right: {right_distance:.2f}m")
+                leftMotor.setVelocity(-self.max_speed * 0.2)
+                rightMotor.setVelocity(self.max_speed * 0.7)
+
+            return py_trees.common.Status.RUNNING
+
+        # No obstacles detected
+        return py_trees.common.Status.SUCCESS
+
 
 class EnhancedObjectRecognizer(py_trees.behaviour.Behaviour):
     """
@@ -448,6 +593,7 @@ class EnhancedObjectRecognizer(py_trees.behaviour.Behaviour):
         samples (int): Number of detection samples to average
         timeout (float): Max allowed recognition time
     """
+
     def __init__(self, name, z_offset=0.0, samples=5, timeout=3.0):
         super(EnhancedObjectRecognizer, self).__init__(name)
         self.z_offset = z_offset
@@ -550,6 +696,7 @@ class ComprehensiveScanner(py_trees.behaviour.Behaviour):
         angle_increment (float): Degrees between positions
         rotation_speed (float): Rad/s for base rotation
     """
+
     def __init__(self, name, total_angles=8, angle_increment=45, rotation_speed=1.0):
         super(ComprehensiveScanner, self).__init__(name)
         self.total_angles = total_angles
@@ -638,6 +785,7 @@ class GraspController(py_trees.behaviour.Behaviour):
     Args:
         force_threshold (float): Minimum grip force (N) for success
     """
+
     def __init__(self, name, force_threshold=-12.0):
         super(GraspController, self).__init__(name)
         self.force_threshold = force_threshold
@@ -758,7 +906,7 @@ class MoveToObject(py_trees.behaviour.Behaviour):
         self.camera = camera
 
         # Distance thresholds
-        self.arm_adjustment_distance = 1.25
+        self.arm_adjustment_distance = 1.28
         self.very_close_distance = 1.0
 
         # Simplified state machine - removed rotation correction
@@ -769,7 +917,7 @@ class MoveToObject(py_trees.behaviour.Behaviour):
         # Control parameters
         self.Kp_linear = 0.9
         self.Kp_angular = 1.0
-        self.Kd_angular = 0.8
+        self.Kd_angular = 1.0
         self.max_speed = 3.0
 
         # Timing parameters
@@ -785,10 +933,7 @@ class MoveToObject(py_trees.behaviour.Behaviour):
         robot.step(timestep * 5)
 
         # Get target position
-        self.current_target = get_target_position(
-            self.name,
-            recognizer=self._recognize_object
-        )
+        self.current_target = get_target_position(self.name)
 
         if self.current_target is None:
             return py_trees.common.Status.FAILURE
@@ -946,219 +1091,118 @@ class MoveToObject(py_trees.behaviour.Behaviour):
 
 class MoveToWaypoint(py_trees.behaviour.Behaviour):
     """
-    Autonomous navigation controller using PID-based motion control.
-    
+    Waypoint navigation behavior using a proportional controller approach.
+
     Features:
-    - Waypoint sequencing with distance thresholds
-    - Anti-wobble steering logic
-    - Stuck detection and recovery
-    - Smooth velocity ramping
-    
+    - Simple proportional control for both linear and angular velocity
+    - Waypoint sequencing with distance threshold
+    - Timeout protection
+
     Args:
-        waypoints (list): Sequence of (x,y,z) targets
-        timeout (float): Max duration per waypoint
+        name (str): Behavior name
+        waypoints (list): List of waypoint coordinates [(x1, y1, z1), (x2, y2, z2), ...]
+        timeout (float): Maximum allowed execution time
     """
-    def __init__(self, name, waypoints, timeout=30.0):
+
+    def __init__(self, name, waypoints, timeout=45.0):
         super(MoveToWaypoint, self).__init__(name)
         self.waypoints = waypoints
-        self.current_waypoint_index = 0
         self.timeout = timeout
+        self.current_waypoint_index = 0
+        self.distance_threshold = 0.15  # Distance to consider waypoint reached
 
-        # Motion parameters - ADJUSTED FOR TIGHTER TURNS
-        self.angle_threshold = 0.1  # Reduced from 0.2 for more precise angle control
-        self.turn_speed = 2.0  # Increased from 1.5 for faster turning
-        self.max_forward_speed = 3.5  # Slightly reduced from 4.0 for better control
-        self.distance_threshold = WAYPOINT_DISTANCE_THRESHOLD
+        # Controller parameters from your original function
+        self.p1 = 4.0  # Angular gain
+        self.p2 = 2.0  # Linear gain
+        self.max_speed = 6.28  # Maximum motor speed
 
-        # Controller parameters - BALANCED FOR STABILITY AND RESPONSIVENESS
-        self.prev_left_speed = 0.0
-        self.prev_right_speed = 0.0
-        self.smoothing_factor = 0.4  # Increased for more smoothing to reduce oscillations
-        self.prev_alpha = 0.0
-        self.kd_angular = 0.9  # Reduced to prevent over-correction
-        self.angular_deadband = 0.05  # Deadband to prevent tiny corrections that cause wobbling
-
-        # Timing variables
+        # Timing
         self.start_time = None
-        self.last_time = None
-
-        # Add progress tracking to detect if robot is stuck
-        self.last_position = None
-        self.stuck_time = None
-        self.progress_check_interval = 3.0  # Check progress every 3 seconds
-        self.last_progress_check = 0
-        self.min_progress_distance = 0.05  # Minimum progress expected in 3 seconds
 
     def initialise(self):
         self.current_waypoint_index = 0
-        self.current_waypoint = self.waypoints[self.current_waypoint_index]
-
-        # Reset control variables
         self.start_time = robot.getTime()
-        self.last_time = self.start_time
-        self.prev_left_speed = 0.0
-        self.prev_right_speed = 0.0
-        self.prev_alpha = 0.0
 
-        # Initialize progress tracking
-        self.last_position = gps.getValues()[:2]
-        self.last_progress_check = self.start_time
-        self.stuck_time = None
+        # Stop motors initially
+        leftMotor.setVelocity(0.0)
+        rightMotor.setVelocity(0.0)
 
-        # Log the starting GPS position and waypoint targets
-        print(f"Starting navigation from GPS position: {self.last_position}")
-        print(f"Target waypoint sequence: {self.waypoints}")
+        gps_pos = gps.getValues()[:2]
+        print(f"{self.name}: Starting navigation from {gps_pos}")
+        print(f"{self.name}: Waypoint sequence: {self.waypoints}")
 
     def update(self):
-        try:
-            current_time = robot.getTime()
+        current_time = robot.getTime()
 
-            # Check for timeout
-            if current_time - self.start_time > self.timeout:
-                print(f"{self.name} timed out after {self.timeout} seconds")
-                leftMotor.setVelocity(0.0)
-                rightMotor.setVelocity(0.0)
-                return py_trees.common.Status.SUCCESS
-
-            # Get current position and orientation from GPS and compass
-            current_pos = gps.getValues()
-            xw, yw = current_pos[:2]
-            compass_values = compass.getValues()
-            theta = np.arctan2(compass_values[0], compass_values[1])
-
-            # Calculate distance and angle to current waypoint
-            target_x, target_y, _ = self.current_waypoint
-            rho = np.sqrt((xw - target_x) ** 2 + (yw - target_y) ** 2)
-            target_angle = np.arctan2(target_y - yw, target_x - xw)
-            alpha = angle_difference(target_angle, theta)
-
-            # Check if we're making progress (every few seconds)
-            if current_time - self.last_progress_check > self.progress_check_interval:
-                dx = xw - self.last_position[0]
-                dy = yw - self.last_position[1]
-                distance_moved = np.sqrt(dx * dx + dy * dy)
-
-                # Log detailed GPS position and progress
-                print(f"GPS Position: ({xw:.3f}, {yw:.3f}), heading: {np.degrees(theta):.1f}°")
-                print(
-                    f"Distance to waypoint: {rho:.3f}m, moved {distance_moved:.3f}m in last {self.progress_check_interval:.1f}s")
-
-                # Check if we're stuck
-                if distance_moved < self.min_progress_distance:
-                    if self.stuck_time is None:
-                        self.stuck_time = current_time
-                        print(f"Warning: Robot may be stuck, minimal progress detected ({distance_moved:.3f}m)")
-                    elif current_time - self.stuck_time > 5.0:
-                        # If stuck for more than 5 seconds, try to recover
-                        print(f"Robot appears stuck at {current_pos}, attempting recovery")
-
-                        # Recovery strategy: rotate slightly to change trajectory
-                        leftMotor.setVelocity(-self.turn_speed * 1.5)  # More aggressive recovery turn
-                        rightMotor.setVelocity(self.turn_speed * 1.5)
-                        robot.step(timestep * 15)  # Rotate for longer time
-
-                        # Reset stuck detection
-                        self.stuck_time = None
-                else:
-                    self.stuck_time = None  # Reset stuck detection if we're moving
-
-                # Update for next progress check
-                self.last_position = [xw, yw]
-                self.last_progress_check = current_time
-
-            # Print status occasionally (using simplified condition)
-            if current_time % 1.0 < timestep / 1000.0:
-                print(
-                    f"Moving to waypoint: {self.current_waypoint}, distance: {rho:.4f}m, angle: {np.degrees(alpha):.2f}°")
-
-            # Calculate time derivatives for control
-            dt = max(current_time - self.last_time, timestep / 1000.0)
-            alpha_rate = (alpha - self.prev_alpha) / dt
-            self.prev_alpha = alpha
-            self.last_time = current_time
-
-            # Check if we've reached the current waypoint
-            if rho < self.distance_threshold:
-                leftMotor.setVelocity(0.0)
-                rightMotor.setVelocity(0.0)
-                print(f"Reached waypoint: {self.current_waypoint} (GPS position: {current_pos[:2]})")
-
-                # Move to next waypoint
-                self.current_waypoint_index += 1
-
-                # If we've reached the end of waypoints, we're done
-                if self.current_waypoint_index >= len(self.waypoints):
-                    print(f"Completed all waypoints! Final GPS position: {current_pos[:2]}")
-                    return py_trees.common.Status.SUCCESS
-
-                # Set up next waypoint and continue
-                self.current_waypoint = self.waypoints[self.current_waypoint_index]
-                return py_trees.common.Status.RUNNING
-
-            # ANTI-WOBBLE STEERING CONTROL - Modified for stability and tighter turns
-            # Apply deadband to prevent tiny corrections that cause wobbling
-            if abs(alpha) < self.angular_deadband and rho > 0.3:
-                # If angle is very small and we're not too close, just go straight
-                alpha_for_control = 0
-                alpha_rate_for_control = 0
-            else:
-                alpha_for_control = alpha
-                alpha_rate_for_control = alpha_rate
-
-            # If large angle difference, prioritize turning in place first
-            if abs(alpha_for_control) > self.angle_threshold * 1.5:  # Less aggressive turning threshold
-                # Turn in place with controlled intensity when angle is large
-                turn_intensity = np.sign(alpha_for_control) * min(1.2, abs(alpha_for_control))  # Less aggressive
-                leftSpeed = -self.turn_speed * turn_intensity
-                rightSpeed = self.turn_speed * turn_intensity
-            else:
-                # More balanced approach for smaller angles
-                speed_factor = min(1.0, max(0.4, rho / 0.5))  # Adjusted min speed factor
-
-                # Adjust turn component based on angle with smoother transition
-                forward_speed = self.max_forward_speed * speed_factor * (
-                        1 - 0.7 * abs(alpha_for_control) / self.angle_threshold)
-
-                # Softer turn components with damping to reduce oscillation
-                turn_component = (self.turn_speed * alpha_for_control / np.pi) - (
-                        self.kd_angular * alpha_rate_for_control)
-
-                # Apply non-linear smoothing to turn component to reduce oscillations
-                turn_component = np.sign(turn_component) * (1 - np.exp(-2 * abs(turn_component)))
-
-                if self.name.startswith("Move to Table Waypoint"):
-                    forward_speed *= 0.7  # Slower for table approach
-
-                leftSpeed = forward_speed - turn_component * self.turn_speed
-                rightSpeed = forward_speed + turn_component * self.turn_speed
-
-            # Apply speed constraints
-            leftSpeed = np.clip(leftSpeed, -self.max_forward_speed, self.max_forward_speed)
-            rightSpeed = np.clip(rightSpeed, -self.max_forward_speed, self.max_forward_speed)
-
-            # Enforce minimum speed for mobility
-            if abs(leftSpeed) < MIN_MOTOR_SPEED and leftSpeed != 0:
-                leftSpeed = np.sign(leftSpeed) * MIN_MOTOR_SPEED
-            if abs(rightSpeed) < MIN_MOTOR_SPEED and rightSpeed != 0:
-                rightSpeed = np.sign(rightSpeed) * MIN_MOTOR_SPEED
-
-            # Apply smoothing to motor commands (reduced smoothing for responsiveness)
-            self.prev_left_speed = self.smoothing_factor * self.prev_left_speed + (
-                    1 - self.smoothing_factor) * leftSpeed
-            self.prev_right_speed = self.smoothing_factor * self.prev_right_speed + (
-                    1 - self.smoothing_factor) * rightSpeed
-
-            # Set motor speeds
-            leftMotor.setVelocity(self.prev_left_speed)
-            rightMotor.setVelocity(self.prev_right_speed)
-
-            return py_trees.common.Status.RUNNING
-
-        except Exception as e:
-            print(f"Error in MoveToWaypoint: {e}")
+        # Check for timeout
+        if current_time - self.start_time > self.timeout:
+            print(f"{self.name} timed out after {self.timeout} seconds.")
             leftMotor.setVelocity(0.0)
             rightMotor.setVelocity(0.0)
-            return py_trees.common.Status.FAILURE
+            return py_trees.common.Status.SUCCESS
+
+        # Get current pose
+        xw = gps.getValues()[0]
+        yw = gps.getValues()[1]
+
+        # Get compass heading
+        compass_vals = compass.getValues()
+        theta = np.arctan2(compass_vals[0], compass_vals[1])
+
+        # Current waypoint
+        current_waypoint = self.waypoints[self.current_waypoint_index]
+
+        # Calculate error and heading
+        rho = np.sqrt((xw - current_waypoint[0]) ** 2 + (yw - current_waypoint[1]) ** 2)
+        alpha = np.arctan2(current_waypoint[1] - yw, current_waypoint[0] - xw) - theta
+
+        # Normalize alpha to be between -pi and pi
+        if alpha > np.pi:
+            alpha = alpha - 2 * np.pi
+        elif alpha < -np.pi:
+            alpha = alpha + 2 * np.pi
+
+        # Calculate velocity based on error and heading
+        vL = -self.p1 * alpha + self.p2 * rho
+        vR = +self.p1 * alpha + self.p2 * rho
+
+        # Apply speed limits
+        vL = min(vL, self.max_speed)
+        vR = min(vR, self.max_speed)
+        vL = max(vL, -self.max_speed)
+        vR = max(vR, -self.max_speed)
+
+        # Set motor velocities
+        leftMotor.setVelocity(vL)
+        rightMotor.setVelocity(vR)
+
+        # Log movement occasionally
+        if int(current_time) % 3 == 0 and abs(current_time - int(current_time)) < 0.1:
+            print(f"GPS=({xw:.2f}, {yw:.2f}), heading={np.degrees(theta):.1f}°, dist to WP={rho:.2f}")
+
+        # Check if waypoint reached
+        if rho < self.distance_threshold:
+            print(f"Reached waypoint: {current_waypoint} (GPS: {xw:.2f}, {yw:.2f})")
+
+            # Move to next waypoint
+            self.current_waypoint_index += 1
+
+            # Check if all waypoints complete
+            if self.current_waypoint_index >= len(self.waypoints):
+                leftMotor.setVelocity(0.0)
+                rightMotor.setVelocity(0.0)
+                print(f"{self.name}: All waypoints reached!")
+                return py_trees.common.Status.SUCCESS
+
+            # Continue to next waypoint
+            return py_trees.common.Status.RUNNING
+
+        return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status):
+        leftMotor.setVelocity(0.0)
+        rightMotor.setVelocity(0.0)
+
 
 
 # --- Manipulation Behaviors ---
@@ -1178,6 +1222,7 @@ class MoveArmIK(py_trees.behaviour.Behaviour):
         tolerance (float): Joint angle tolerance (rad)
         timeout (float): Max allowed motion time
     """
+
     def __init__(self, name, offset_x=0.0, offset_y=0.0, tolerance=0.015, timeout=5.0):
         super(MoveArmIK, self).__init__(name)
         self.offset_x = offset_x
@@ -1463,6 +1508,7 @@ class LiftAndVerify(py_trees.behaviour.Behaviour):
         timeout (float): Max lift duration
         force_threshold (float): Minimum required grip force
     """
+
     def __init__(self, name, lift_positions, timeout=2.0, force_threshold=-5.0):
         super(LiftAndVerify, self).__init__(name)
         self.lift_positions = lift_positions  # Dictionary of joint positions for lifting
@@ -1542,6 +1588,7 @@ class BackupAfterGrasp(py_trees.behaviour.Behaviour):
         backup_distance (float): Desired retreat distance (m)
         duration (float): Maximum allowed backup time (s)
     """
+
     def __init__(self, name, backup_distance=0.12, duration=3.0):
         super(BackupAfterGrasp, self).__init__(name)
         self.backup_distance = backup_distance
@@ -1644,110 +1691,146 @@ class CheckHardwareStatus(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+
 # ------------------------------------------------------------------------------
 # BEHAVIOR TREE CONSTRUCTION
 # ------------------------------------------------------------------------------
 def create_behavior_tree():
-    # Initialize y_offsets with defaults if not provided
-    root = py_trees.composites.Sequence(name="Root", memory=True)
+    # Create the root of the behavior tree as a sequence node
+    # A sequence executes its children in order and requires all to succeed
+    root = py_trees.composites.Sequence(name="Root", memory=True)  # memory=True means it remembers child states
+    # between ticks
 
-    # Initialize and check hardware
+    # --- INITIALIZATION PHASE ---
+    # Create initialization sequence to check hardware and move to a safe starting position
     initialization = py_trees.composites.Sequence(name="Initialization", memory=True)
-    check_hardware = CheckHardwareStatus("Check Hardware Status")
-    move_to_safe_position = MoveToPosition("Move to Safe Position", starting_position)
-    initialization.add_children([check_hardware, move_to_safe_position])
+    check_hardware = CheckHardwareStatus("Check Hardware Status")  # Verifies all required hardware components are
+    # working
+    move_to_safe_position = MoveToPosition("Move to Safe Position", starting_position)  # Moves arm to predefined
+    # safe position
+    initialization.add_children([check_hardware, move_to_safe_position])  # Add behaviors to initialization sequence
 
-    # Default Y offsets for each jar
-    y_offsets = [0.13, -0.85, -0.60]
+    # Y-axis offsets for approaching each jar - these are custom values for precise positioning
+    # Different offsets are needed for each jar based on their position on the counter
+    y_offsets = [0.13, -0.65, -0.6]  # Custom Y offsets for jars 1, 2, and 3
 
-    # Add initialization to root
+    # Add initialization sequence to the root
     root.add_children([initialization])
 
-    # Main task sequence with fallbacks
+    # --- TASK SEQUENCES FOR EACH JAR ---
+    # Create a separate handling sequence for each of the 3 jars
     for i in range(3):  # Handle 3 jars
+        # Create a sequence for this specific jar
         jar_sequence = py_trees.composites.Sequence(name=f"Handle Jar {i + 1}", memory=True)
 
-        # Use same approach for all jars
-        find_object = py_trees.composites.Selector(name="Find Object", memory=True)
+        # --- OBJECT DETECTION PHASE ---
+        # Create a selector for finding objects (tries first method, falls back to second if needed)
+        find_object = py_trees.composites.Selector(name="Find Object", memory=True)  # Selector tries children until
+        # one succeeds
 
-        # First try direct recognition (exactly like jar 1)
-        recognize = EnhancedObjectRecognizer(f"Recognize Object {i + 1}", timeout=3.0)
+        # Try direct recognition first (faster, less movement required)
+        recognize = EnhancedObjectRecognizer(f"Recognize Object {i + 1}", timeout=3.0)  # Uses camera to recognize
+        # objects
 
-        # If direct recognition fails, try incremental scanning
-        comprehensive_scanner = ComprehensiveScanner("Comprehensive Scanner", total_angles=8, angle_increment=45)
+        # If direct recognition fails, use the comprehensive scanner (more thorough but slower)
+        comprehensive_scanner = ComprehensiveScanner("Comprehensive Scanner",
+                                                    total_angles=8,  # Scan in 8 different directions
+                                                    angle_increment=45)  # 45° between scan positions = full 360°
+        # coverage
 
-        # Add both direct recognition and scan-based recognition to the selector
+        # Add both detection strategies to the selector
         find_object.add_children([recognize, comprehensive_scanner])
 
-        # Direct approach sequence without recovery wrapper
+        # --- APPROACH SEQUENCE ---
+        # Setup approach sequence to position robot properly before grasping
         approach_sequence = py_trees.composites.Sequence(name="Approach Sequence", memory=True)
 
-        # Prepare arm for approach
-        prepare_arm = MoveToPosition(f"Prepare Arm for Approach {i + 1}", lift_position)
+        # Prepare arm for approach by moving to pre-approach position
+        prepare_arm = MoveToPosition(f"Prepare Arm for Approach {i + 1}", lift_position)  # Moves arm to ready position
 
-        # Create arm movement behavior with Y offset only for each jar
+        # Create arm movement behavior with custom Y offset for each jar
+        # This uses inverse kinematics to position the arm properly for grasping
         move_arm_behavior = MoveArmIK(
             f"Move Arm {i + 1}",
-            offset_x=0.0,  # Use fixed zero X offset
-            offset_y=y_offsets[i]  # Use custom Y offset for this jar
+            offset_x=0.0,  # No X-axis offset needed
+            offset_y=y_offsets[i]  # Use the custom Y offset for this specific jar
         )
 
-        move_to_object = MoveToObject(
+        # Create the move-to-object behavior that navigates the robot to the jar
+        basic_move_to_object = MoveToObject(
             f"Move to Object {i + 1}",
-            None,  # Use blackboard for target position
-            gps,
-            compass,
-            move_arm_behavior,
-            camera
+            None,  # Target position comes from blackboard, not hardcoded
+            gps,  # Provides position information
+            compass,  # Provides orientation information
+            move_arm_behavior,  # Arm movement to execute during approach
+            camera  # Used for visual feedback
         )
+
+        # Wrap navigation with obstacle avoidance capability
+        move_to_object = create_movement_with_avoidance(basic_move_to_object)  # Adds LIDAR-based obstacle detection
 
         # Add behaviors to approach sequence
         approach_sequence.add_children([prepare_arm, move_to_object])
 
-        # Simple direct grasp without retry mechanism
+        # --- GRASPING PHASE ---
+        # Create grasp behavior that controls the gripper to grab the jar
         grasp_behavior = GraspController(
             f"Grasp Object {i + 1}",
-            force_threshold=-10.0
+            force_threshold=-10.0  # Force threshold for detecting successful grasp
         )
 
-        # Enhanced transport and place sequence
+        # --- TRANSPORT AND PLACEMENT PHASE ---
+        # Create sequence for transporting jar to the table and placing it
         transport_and_place = py_trees.composites.Sequence(name="Transport and Place", memory=True)
 
-        lift_object = LiftAndVerify(f"Lift and Verify {i + 1}", lift_position)
+        # Lift and verify ensures object is securely grasped before transportation
+        lift_object = LiftAndVerify(f"Lift and Verify {i + 1}", lift_position)  # Lifts object and checks grip
 
-        backup = BackupAfterGrasp(f"Backup After Grasp {i + 1}")
+        # Backup after grasp moves robot backward to create clearance before turning
+        backup = BackupAfterGrasp(f"Backup After Grasp {i + 1}")  # Creates space for safe turning
 
-        move_to_table_bt = MoveToWaypoint(f"Move to Table Waypoint {i + 1}", table_waypoints)
-        place_object_bt = MoveToPosition(f"Place Object {i + 1}", place_position, timeout=8.0)
-        open_gripper_bt = OpenGripper(f"Open Gripper {i + 1}")
-        reset_for_home = MoveToPosition(f"Reset Arm For Home {i + 1}", starting_position, timeout=4.0)
-        move_to_home_bt = MoveToWaypoint(f"Move to Home Waypoint {i + 1}", home_waypoint)
+        # Create waypoint navigation behaviors
+        basic_move_to_table = MoveToWaypoint(f"Move to Table Waypoint {i + 1}", table_waypoints)  # Navigate to table
+        basic_move_to_home = MoveToWaypoint(f"Move to Home Waypoint {i + 1}", home_waypoint)  # Return to home position
 
-        # Combine the transport
+        # Wrap waypoint navigation with obstacle avoidance
+        move_to_table_bt = create_movement_with_avoidance(basic_move_to_table)
+        move_to_home_bt = create_movement_with_avoidance(basic_move_to_home)
+
+        # Create behaviors for placing object on table
+        place_object_bt = MoveToPosition(f"Place Object {i + 1}", place_position, timeout=8.0)  # Position arm for
+        # placement
+        open_gripper_bt = OpenGripper(f"Open Gripper {i + 1}")  # Release the object
+        reset_for_home = MoveToPosition(f"Reset Arm For Home {i + 1}", starting_position, timeout=4.0)  # Return arm
+        # to safe position
+
+        # Add all transport behaviors to the sequence in proper order
         transport_and_place.add_children([
-            py_trees.behaviours.Success(name=f"StartTransport_{i + 1}"),
-            lift_object,
-            backup,
-            move_to_table_bt,
-            place_object_bt,
-            open_gripper_bt,
-            reset_for_home,
-            move_to_home_bt
+            py_trees.behaviours.Success(name=f"StartTransport_{i + 1}"),  # Marks start of transport phase
+            lift_object,        # 1. Lift and verify secure grasp
+            backup,             # 2. Back up for clearance
+            move_to_table_bt,   # 3. Navigate to table
+            place_object_bt,    # 4. Position arm for placement
+            open_gripper_bt,    # 5. Release the object
+            reset_for_home,     # 6. Return arm to safe position
+            move_to_home_bt     # 7. Return robot to home position
         ])
 
-        # Add all tasks to jar_sequence
+        # --- COMBINE ALL PHASES ---
+        # Add all task phases to the jar sequence in order
         jar_sequence.add_children([
-            find_object,
-            approach_sequence,
-            grasp_behavior,
-            transport_and_place
+            find_object,        # 1. Find the jar
+            approach_sequence,  # 2. Approach the jar
+            grasp_behavior,     # 3. Grasp the jar
+            transport_and_place # 4. Transport and place the jar
         ])
 
-        # Add jar_sequence to root
+        # Add this jar's sequence to the root
         root.add_child(jar_sequence)
 
-    # Create the behavior tree
+    # Create the behavior tree from the root
     behavior_tree = py_trees.trees.BehaviourTree(root)
+    # Add debug visitor for logging and visualization
     behavior_tree.visitors.append(py_trees.visitors.DebugVisitor())
     return behavior_tree
 
@@ -1766,6 +1849,7 @@ class RuntimeMonitor:
     Args:
         log_interval (float): Seconds between status reports
     """
+
     def __init__(self, log_interval=10.0):
         self.start_time = robot.getTime()
         self.last_log_time = self.start_time
@@ -1878,7 +1962,7 @@ def main():
     # Create runtime monitor
     monitor = RuntimeMonitor(log_interval=10.0)
 
-    # Use the improved behavior tree with custom Y offsets
+    # Use the behavior tree to control the robot
     behavior_tree = create_behavior_tree()
     behavior_tree.setup(timeout=15)
 
